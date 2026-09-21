@@ -67,9 +67,21 @@ func Test_parseDeviceKeepaliveWidths(t *testing.T) {
 			want:    10 * time.Second,
 		},
 		{
-			name:    "u32 dkms v3.0",
-			payload: nlenc.Uint32Bytes(25),
+			// dkms v3: a packed u16 range hi<<16|lo; the fixed range 25..25.
+			name:    "u32 dkms v3 fixed range",
+			payload: nlenc.Uint32Bytes(25<<16 | 25),
 			want:    25 * time.Second,
+		},
+		{
+			// A real range (set by awg-tools) reports its lower bound.
+			name:    "u32 dkms v3 range 20..30",
+			payload: nlenc.Uint32Bytes(30<<16 | 20),
+			want:    20 * time.Second,
+		},
+		{
+			name:    "u32 dkms v3 disabled",
+			payload: nlenc.Uint32Bytes(0),
+			want:    0,
 		},
 	}
 
@@ -176,54 +188,124 @@ func Test_configAttrsKeepaliveWidthByFamilyVersion(t *testing.T) {
 			if len(ka) != tt.wantLen {
 				t.Fatalf("keepalive attribute length = %d, want %d", len(ka), tt.wantLen)
 			}
+			// v3 takes a packed u16 range (hi<<16|lo): a bare 10 would be the
+			// inverted range 10..0, from which the module picks a garbage delay.
+			if tt.wantLen == 4 {
+				if v := nlenc.Uint32(ka); v != 10<<16|10 {
+					t.Fatalf("keepalive = %#x, want the fixed range 10..10 (%#x)", v, 10<<16|10)
+				}
+			} else if v := nlenc.Uint16(ka); v != 10 {
+				t.Fatalf("keepalive = %d, want 10", v)
+			}
 		})
 	}
 }
 
-func Test_configAttrsMagicHeadersByFamilyVersion(t *testing.T) {
-	h1 := "123456"
-	cfg := wgtypes.Config{H1: &h1}
-
-	// genl 2 (dkms v1.x): NUL-terminated string, ranges allowed.
-	b, err := configAttrs("wg0", cfg, 2)
-	if err != nil {
-		t.Fatalf("configAttrs(v2): %v", err)
-	}
-	got, ok := deviceAttrs(t, b)[WGDEVICE_A_H1]
-	if !ok {
-		t.Fatal("v2: no H1 attribute encoded")
-	}
-	if s := nlenc.String(got); s != h1 {
-		t.Fatalf("v2: H1 = %q, want %q", s, h1)
+func Test_configAttrsKeepaliveV3Bounds(t *testing.T) {
+	encode := func(d time.Duration) ([]byte, error) {
+		return configAttrs("wg0", wgtypes.Config{Peers: []wgtypes.PeerConfig{{
+			PublicKey:                   wgtest.MustPublicKey(),
+			PersistentKeepaliveInterval: &d,
+		}}}, genlVersionAWG3)
 	}
 
-	// genl 3 (dkms v3.0): single u64 value.
-	b, err = configAttrs("wg0", cfg, genlVersionAWG3)
+	// 0 disables keepalive and must stay 0 (the module tests the whole range
+	// for zero).
+	b, err := encode(0)
 	if err != nil {
-		t.Fatalf("configAttrs(v3): %v", err)
+		t.Fatalf("configAttrs(0): %v", err)
 	}
-	got, ok = deviceAttrs(t, b)[WGDEVICE_A_H1]
-	if !ok {
-		t.Fatal("v3: no H1 attribute encoded")
+	if v := nlenc.Uint32(firstPeerAttrs(t, b)[unix.WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL]); v != 0 {
+		t.Fatalf("disabled keepalive = %#x, want 0", v)
 	}
-	if len(got) != 8 {
-		t.Fatalf("v3: H1 attribute length = %d, want 8", len(got))
-	}
-	if v := nlenc.Uint64(got); v != 123456 {
-		t.Fatalf("v3: H1 = %d, want 123456", v)
+
+	// Each bound is a u16: more than 65535s can't be represented.
+	if _, err := encode(70000 * time.Second); err == nil {
+		t.Fatal("configAttrs accepted a keepalive interval over 65535s")
 	}
 }
 
-func Test_configAttrsMagicHeaderRangeRejectedOnV3(t *testing.T) {
-	h1 := "123456-123999"
-	cfg := wgtypes.Config{H1: &h1}
-
-	if _, err := configAttrs("wg0", cfg, genlVersionAWG3); err == nil {
-		t.Fatal("configAttrs(v3) accepted a range magic header")
+func Test_configAttrsMagicHeadersByFamilyVersion(t *testing.T) {
+	// dkms v3 stores a magic header as a u32_range_t: a u64 holding hi<<32|lo
+	// (src/type.h). A single value N is the range N..N — NOT a bare N, which
+	// would be the inverted range N..0 that matches no incoming packet.
+	tests := []struct {
+		name   string
+		header string
+		wantV3 uint64
+	}{
+		{name: "single value", header: "123456", wantV3: 123456<<32 | 123456},
+		{name: "range", header: "523920657-651671620", wantV3: 651671620<<32 | 523920657},
+		{name: "range with spaces", header: " 5 - 4294967295 ", wantV3: 4294967295<<32 | 5},
 	}
 
-	// The same range must still encode fine for dkms v1.x.
-	if _, err := configAttrs("wg0", cfg, 2); err != nil {
-		t.Fatalf("configAttrs(v2) rejected a range magic header: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := wgtypes.Config{H1: &tt.header}
+
+			// genl 2 (dkms v1.x): the string goes on the wire untouched.
+			b, err := configAttrs("wg0", cfg, 2)
+			if err != nil {
+				t.Fatalf("configAttrs(v2): %v", err)
+			}
+			got, ok := deviceAttrs(t, b)[WGDEVICE_A_H1]
+			if !ok {
+				t.Fatal("v2: no H1 attribute encoded")
+			}
+			if s := nlenc.String(got); s != tt.header {
+				t.Fatalf("v2: H1 = %q, want %q", s, tt.header)
+			}
+
+			// genl 3 (dkms v3): packed u64 range.
+			b, err = configAttrs("wg0", cfg, genlVersionAWG3)
+			if err != nil {
+				t.Fatalf("configAttrs(v3): %v", err)
+			}
+			got, ok = deviceAttrs(t, b)[WGDEVICE_A_H1]
+			if !ok {
+				t.Fatal("v3: no H1 attribute encoded")
+			}
+			if len(got) != 8 {
+				t.Fatalf("v3: H1 attribute length = %d, want 8", len(got))
+			}
+			if v := nlenc.Uint64(got); v != tt.wantV3 {
+				t.Fatalf("v3: H1 = %#x, want %#x (hi<<32|lo)", v, tt.wantV3)
+			}
+		})
+	}
+}
+
+// All four headers land on their own attribute, each packed independently.
+func Test_configAttrsMagicHeadersV3AllFour(t *testing.T) {
+	h1, h2, h3, h4 := "100-199", "200-299", "300", "400-499"
+	b, err := configAttrs("wg0", wgtypes.Config{H1: &h1, H2: &h2, H3: &h3, H4: &h4}, genlVersionAWG3)
+	if err != nil {
+		t.Fatalf("configAttrs: %v", err)
+	}
+	attrs := deviceAttrs(t, b)
+	for typ, want := range map[uint16]uint64{
+		WGDEVICE_A_H1: 199<<32 | 100,
+		WGDEVICE_A_H2: 299<<32 | 200,
+		WGDEVICE_A_H3: 300<<32 | 300,
+		WGDEVICE_A_H4: 499<<32 | 400,
+	} {
+		if v := nlenc.Uint64(attrs[typ]); v != want {
+			t.Errorf("attribute %d = %#x, want %#x", typ, v, want)
+		}
+	}
+}
+
+func Test_configAttrsMagicHeaderInvalidOnV3(t *testing.T) {
+	for _, header := range []string{"", "abc", "10-", "-10", "20-10", "4294967296", "1-4294967296", "1-2-3"} {
+		h := header
+		_, err := configAttrs("wg0", wgtypes.Config{H2: &h}, genlVersionAWG3)
+		if err == nil {
+			t.Errorf("configAttrs(v3) accepted magic header %q", header)
+			continue
+		}
+		// The error names the header by its config name, not its attribute number.
+		if !strings.Contains(err.Error(), "H2") {
+			t.Errorf("%q: error %q doesn't name H2", header, err)
+		}
 	}
 }

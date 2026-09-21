@@ -114,15 +114,18 @@ func parsePeer(ad *netlink.AttributeDecoder) wgtypes.Peer {
 			ad.Do(parseSockaddr(p.Endpoint))
 		case unix.WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL:
 			// Mainline WireGuard and amneziawg-dkms up to v1.x send this as a
-			// u16; amneziawg-dkms v3.0 (genl family version 3) widened it to a
-			// u32. Accept both — otherwise a single v3 peer makes its whole
-			// device (and with it Devices()) unparseable.
+			// u16; amneziawg-dkms v3 (genl family version 3) sends a u32
+			// holding a packed u16 range, `hi<<16 | lo` seconds (see
+			// genlVersionAWG3). Accept both — otherwise a single v3 peer makes
+			// its whole device (and with it Devices()) unparseable. wgtypes
+			// has one interval, so a range reports its lower bound (for the
+			// fixed N..N range this package writes, that's N).
 			ad.Do(func(b []byte) error {
 				switch len(b) {
 				case 2:
 					p.PersistentKeepaliveInterval = time.Duration(nlenc.Uint16(b)) * time.Second
 				case 4:
-					p.PersistentKeepaliveInterval = time.Duration(nlenc.Uint32(b)) * time.Second
+					p.PersistentKeepaliveInterval = time.Duration(uint16(nlenc.Uint32(b))) * time.Second
 				default:
 					return fmt.Errorf("wglinux: unexpected persistent keepalive interval length: %d", len(b))
 				}

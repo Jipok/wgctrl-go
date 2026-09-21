@@ -6,8 +6,11 @@ package wglinux
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
+	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/Jipok/wgctrl-go/wgtypes"
@@ -38,14 +41,56 @@ const (
 	WGDEVICE_A_I5 = 25
 )
 
-// genlVersionAWG3 is the generic netlink family version amneziawg-dkms v3.0
+// genlVersionAWG3 is the generic netlink family version amneziawg-dkms v3.x
 // reports (WG_GENL_VERSION; mainline WireGuard reports 1, amneziawg-dkms v1.x
-// reports 2). v3.0 changed two attribute encodings on the wire:
-// WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL became a u32 (u16 before) and
-// WGDEVICE_A_H1..H4 became u64 values (NUL-terminated range strings before) —
-// its nla_policy rejects the old widths, so writes must match the family
-// version the kernel reported.
+// reports 2). v3.0 moved two attributes to packed integer RANGES (see the
+// module's src/type.h), and its nla_policy rejects the old widths, so writes
+// must match the family version the kernel reported:
+//
+//   - WGDEVICE_A_H1..H4: a u32_range_t, i.e. a u64 holding `hi<<32 | lo`
+//     (NUL-terminated "lo-hi" strings before). A single magic header N is the
+//     range N..N. The module checks incoming headers with lo <= h <= hi and
+//     picks outgoing ones uniformly in [lo, hi].
+//   - WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL: a u16_range_t, i.e. a u32
+//     holding `hi<<16 | lo` seconds (a plain u16 before); the module picks each
+//     keepalive delay uniformly in [lo, hi]. 0 still disables it.
+//
+// Writing a bare value N into either — hi = 0 — is NOT "just N": it's the
+// inverted range N..0, which matches no incoming header and makes the module's
+// get_random_u32_inclusive(lo, hi) wrap around to an arbitrary value.
 const genlVersionAWG3 = 3
+
+// awg3MagicHeader packs a magic header — a single value "N" or an AmneziaWG
+// 2.0 range "lo-hi", both u32 — into amneziawg-dkms v3's u32_range_t wire
+// form (`hi<<32 | lo`).
+func awg3MagicHeader(s string) (uint64, error) {
+	loStr, hiStr, isRange := strings.Cut(strings.TrimSpace(s), "-")
+	if !isRange {
+		hiStr = loStr
+	}
+	lo, err := strconv.ParseUint(strings.TrimSpace(loStr), 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a u32 value or a lo-hi range of u32 values", s)
+	}
+	hi, err := strconv.ParseUint(strings.TrimSpace(hiStr), 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a u32 value or a lo-hi range of u32 values", s)
+	}
+	if lo > hi {
+		return 0, fmt.Errorf("range %q is inverted (lo > hi)", s)
+	}
+	return hi<<32 | lo, nil
+}
+
+// awg3KeepaliveRange packs a keepalive interval into amneziawg-dkms v3's
+// u16_range_t wire form (`hi<<16 | lo`) as the fixed range secs..secs.
+func awg3KeepaliveRange(d time.Duration) (uint32, error) {
+	secs := int64(d / time.Second)
+	if secs < 0 || secs > math.MaxUint16 {
+		return 0, fmt.Errorf("wglinux: persistent keepalive interval %s is out of range (0-%ds)", d, math.MaxUint16)
+	}
+	return uint32(secs)<<16 | uint32(secs), nil
+}
 
 // configAttrs creates the required encoded netlink attributes to configure
 // the device specified by name using the non-nil fields in cfg. genlVersion
@@ -101,9 +146,9 @@ func configAttrs(name string, cfg wgtypes.Config, genlVersion uint8) ([]byte, er
 		ae.Uint16(WGDEVICE_A_S4, uint16(*cfg.S4))
 	}
 
-	// Magic Headers. Up to amneziawg-dkms v1.x these are NUL-terminated
-	// strings (a single value or an AmneziaWG 2.0 range like "123456-123999");
-	// v3.0 accepts only a single u64 value.
+	// Magic Headers: a single value or an AmneziaWG 2.0 range like
+	// "123456-123999". Up to amneziawg-dkms v1.x that string goes on the wire
+	// as is (NUL-terminated); v3 takes it packed into a u64 (awg3MagicHeader).
 	for _, h := range []struct {
 		typ uint16
 		val *string
@@ -117,9 +162,9 @@ func configAttrs(name string, cfg wgtypes.Config, genlVersion uint8) ([]byte, er
 			continue
 		}
 		if genlVersion >= genlVersionAWG3 {
-			v, err := strconv.ParseUint(*h.val, 10, 64)
+			v, err := awg3MagicHeader(*h.val)
 			if err != nil {
-				return nil, fmt.Errorf("wglinux: magic header attribute %d: amneziawg-dkms v3 accepts a single numeric value, not %q (ranges are not supported by v3)", h.typ, *h.val)
+				return nil, fmt.Errorf("wglinux: magic header H%d: %w", h.typ-WGDEVICE_A_H1+1, err)
 			}
 			ae.Uint64(h.typ, v)
 		} else {
@@ -308,11 +353,16 @@ func encodePeer(p wgtypes.PeerConfig, genlVersion uint8) func(ae *netlink.Attrib
 		}
 
 		if p.PersistentKeepaliveInterval != nil {
-			// amneziawg-dkms v3.0's nla_policy declares this NLA_U32 and
-			// rejects the mainline u16 width, and vice versa — match the
-			// width to the family version the kernel reported.
+			// amneziawg-dkms v3's nla_policy declares this NLA_U32 (a packed
+			// u16 range, see genlVersionAWG3) and rejects the mainline u16
+			// width, and vice versa — match the encoding to the family
+			// version the kernel reported.
 			if genlVersion >= genlVersionAWG3 {
-				ae.Uint32(unix.WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL, uint32(p.PersistentKeepaliveInterval.Seconds()))
+				v, err := awg3KeepaliveRange(*p.PersistentKeepaliveInterval)
+				if err != nil {
+					return err
+				}
+				ae.Uint32(unix.WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL, v)
 			} else {
 				ae.Uint16(unix.WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL, uint16(p.PersistentKeepaliveInterval.Seconds()))
 			}
