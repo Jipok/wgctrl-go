@@ -121,6 +121,37 @@ func writeConfig(w io.Writer, cfg wgtypes.Config) {
 		fmt.Fprintf(w, "i5=%s\n", *cfg.I5)
 	}
 
+	// AmneziaWG 3.0 parameters. Unlike the netlink path the textual protocol
+	// is self-describing, so no version gating is required here: a 2.0 daemon
+	// would simply reject these keys, and callers only set them for 3.x.
+	if cfg.HeaderProtectionKey != nil {
+		fmt.Fprintf(w, "header_protection_key=%s\n", hex.EncodeToString(cfg.HeaderProtectionKey[:]))
+	}
+
+	for _, r := range []struct {
+		key string
+		val *wgtypes.UintRange
+	}{
+		{"content_padding_addition", cfg.ContentPaddingAddition},
+		{"rekey_after_time", cfg.RekeyAfterTime},
+		{"rekey_timeout", cfg.RekeyTimeout},
+		{"reject_after_time", cfg.RejectAfterTime},
+		{"keepalive_timeout", cfg.KeepaliveTimeout},
+		{"max_handshake_attempts", cfg.MaxHandshakeAttempts},
+	} {
+		if r.val != nil {
+			fmt.Fprintf(w, "%s=%s\n", r.key, r.val)
+		}
+	}
+
+	// AmneziaWG 3.1 booleans.
+	if cfg.RandomTrailers != nil {
+		fmt.Fprintf(w, "random_trailers=%s\n", boolText(*cfg.RandomTrailers))
+	}
+	if cfg.DisableCookies != nil {
+		fmt.Fprintf(w, "disable_cookies=%s\n", boolText(*cfg.DisableCookies))
+	}
+
 	// --- AmneziaWG Parameters End ---
 
 	if cfg.ReplacePeers {
@@ -163,4 +194,12 @@ func writeConfig(w io.Writer, cfg wgtypes.Config) {
 // hexKey encodes a wgtypes.Key into a hexadecimal string.
 func hexKey(k wgtypes.Key) string {
 	return hex.EncodeToString(k[:])
+}
+
+// boolText renders a bool the way the AmneziaWG userspace daemon expects it.
+func boolText(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
 }

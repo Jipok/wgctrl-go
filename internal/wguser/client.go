@@ -48,9 +48,7 @@ func (c *Client) Devices() ([]*wgtypes.Device, error) {
 		}
 
 		// Check if the socket path indicates an AmneziaWG device.
-		if strings.Contains(d, "amneziawg") {
-			wgd.IsAmnezia = true
-		}
+		markAmnezia(wgd, d)
 
 		wgds = append(wgds, wgd)
 	}
@@ -75,11 +73,7 @@ func (c *Client) Device(name string) (*wgtypes.Device, error) {
 			return nil, err
 		}
 
-		// Check if the socket path indicates an AmneziaWG device.
-		if strings.Contains(d, "amneziawg") {
-			wgd.IsAmnezia = true
-		}
-
+		markAmnezia(wgd, d)
 		return wgd, nil
 	}
 
@@ -107,6 +101,21 @@ func (c *Client) ConfigureDevice(name string, cfg wgtypes.Config) error {
 // deviceName infers a device name from an absolute file path with extension.
 func deviceName(sock string) string {
 	return strings.TrimSuffix(filepath.Base(sock), filepath.Ext(sock))
+}
+
+// markAmnezia flags a device as AmneziaWG when its socket lives in an
+// AmneziaWG directory. The UAPI protocol cannot distinguish 1.5 from 2.0, so
+// anything without newer markers is reported as the conservative 2.0, which
+// every AmneziaWG daemon supports.
+func markAmnezia(d *wgtypes.Device, sock string) {
+	if !strings.Contains(sock, "amneziawg") {
+		return
+	}
+
+	d.IsAmnezia = true
+	if d.AmneziaVersion == wgtypes.AWGNone {
+		d.AmneziaVersion = wgtypes.AWG20
+	}
 }
 
 func panicf(format string, a ...interface{}) {

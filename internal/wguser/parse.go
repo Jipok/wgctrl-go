@@ -79,6 +79,10 @@ type deviceParser struct {
 	parsePeers    bool
 	peers         int
 	hsSec, hsNano int
+
+	// sawRandomTrailers records that the 3.1 daemon emitted its boolean,
+	// even when it was set to 0.
+	sawRandomTrailers bool
 }
 
 // Device returns a Device or any errors that were encountered while parsing
@@ -90,8 +94,35 @@ func (dp *deviceParser) Device() (*wgtypes.Device, error) {
 
 	// Compute remaining fields of the Device now that all parsing is done.
 	dp.d.PublicKey = dp.d.PrivateKey.PublicKey()
+	dp.d.AmneziaVersion = dp.amneziaVersion()
 
 	return &dp.d, nil
+}
+
+// amneziaVersion infers the AmneziaWG generation from the UAPI response, or
+// AWGNone when nothing AmneziaWG-specific is present.
+//
+// The 3.1 daemon always emits its two booleans, making them a reliable
+// marker. The 3.0 parameters, however, are only reported once set, so a 3.0
+// daemon without any of them configured is indistinguishable from 2.0 and is
+// reported as such. 1.5 and 2.0 are never distinguishable from the outside;
+// callers should treat the result as a lower bound.
+func (dp *deviceParser) amneziaVersion() wgtypes.AmneziaVersion {
+	switch {
+	case dp.sawRandomTrailers:
+		return wgtypes.AWG31
+	case dp.d.HeaderProtectionKey != nil || dp.d.ContentPaddingAddition != nil ||
+		dp.d.RekeyAfterTime != nil || dp.d.RekeyTimeout != nil ||
+		dp.d.RejectAfterTime != nil || dp.d.KeepaliveTimeout != nil ||
+		dp.d.MaxHandshakeAttempts != nil:
+		return wgtypes.AWG30
+	case dp.d.Jc != 0 || dp.d.Jmin != 0 || dp.d.Jmax != 0 ||
+		dp.d.S1 != 0 || dp.d.S2 != 0 || dp.d.S3 != 0 || dp.d.S4 != 0 ||
+		!dp.d.H1.IsZero() || dp.d.I1 != "":
+		return wgtypes.AWG20
+	default:
+		return wgtypes.AWGNone
+	}
 }
 
 // Parse parses a single key/value pair into fields of a Device.
@@ -132,6 +163,83 @@ func (dp *deviceParser) Parse(key, value string) {
 		dp.d.ListenPort = dp.parseInt(value)
 	case "fwmark":
 		dp.d.FirewallMark = dp.parseInt(value)
+	case "jc":
+		dp.d.Jc = dp.parseInt(value)
+	case "jmin":
+		dp.d.Jmin = dp.parseInt(value)
+	case "jmax":
+		dp.d.Jmax = dp.parseInt(value)
+	case "s1":
+		dp.d.S1 = dp.parseInt(value)
+	case "s2":
+		dp.d.S2 = dp.parseInt(value)
+	case "s3":
+		dp.d.S3 = dp.parseInt(value)
+	case "s4":
+		dp.d.S4 = dp.parseInt(value)
+	case "h1", "h2", "h3", "h4":
+		r, err := wgtypes.ParseUintRange(value)
+		if err != nil {
+			dp.err = err
+			return
+		}
+		switch key {
+		case "h1":
+			dp.d.H1 = r
+		case "h2":
+			dp.d.H2 = r
+		case "h3":
+			dp.d.H3 = r
+		case "h4":
+			dp.d.H4 = r
+		}
+	case "i1", "i2", "i3", "i4", "i5":
+		switch key {
+		case "i1":
+			dp.d.I1 = value
+		case "i2":
+			dp.d.I2 = value
+		case "i3":
+			dp.d.I3 = value
+		case "i4":
+			dp.d.I4 = value
+		case "i5":
+			dp.d.I5 = value
+		}
+	case "header_protection_key":
+		b, err := hex.DecodeString(value)
+		if err != nil || len(b) != 32 {
+			return
+		}
+		key := [32]byte(b)
+		dp.d.HeaderProtectionKey = &key
+	case "content_padding_addition", "rekey_after_time", "rekey_timeout",
+		"reject_after_time", "keepalive_timeout", "max_handshake_attempts":
+		r, err := wgtypes.ParseUintRange(value)
+		if err != nil {
+			dp.err = err
+			return
+		}
+		switch key {
+		case "content_padding_addition":
+			dp.d.ContentPaddingAddition = &r
+		case "rekey_after_time":
+			dp.d.RekeyAfterTime = &r
+		case "rekey_timeout":
+			dp.d.RekeyTimeout = &r
+		case "reject_after_time":
+			dp.d.RejectAfterTime = &r
+		case "keepalive_timeout":
+			dp.d.KeepaliveTimeout = &r
+		case "max_handshake_attempts":
+			dp.d.MaxHandshakeAttempts = &r
+		}
+	case "random_trailers":
+		dp.sawRandomTrailers = true
+		dp.d.RandomTrailers = value != "0"
+		dp.d.SawRandomTrailers = true
+	case "disable_cookies":
+		dp.d.DisableCookies = value != "0"
 	}
 }
 
@@ -165,7 +273,14 @@ func (dp *deviceParser) peerParse(key, value string) {
 	case "rx_bytes":
 		p.ReceiveBytes = dp.parseInt64(value)
 	case "persistent_keepalive_interval":
-		p.PersistentKeepaliveInterval = time.Duration(dp.parseInt(value)) * time.Second
+		// AmneziaWG 3.x reports a range; older releases and WireGuard report
+		// a plain number. UintRange.ParseUintRange handles both.
+		r, err := wgtypes.ParseUintRange(value)
+		if err != nil {
+			dp.err = err
+			return
+		}
+		p.PersistentKeepaliveInterval = time.Duration(r.Lo) * time.Second
 	case "allowed_ip":
 		cidr := dp.parseCIDR(value)
 		if cidr != nil {

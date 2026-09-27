@@ -153,7 +153,7 @@ func (c *Client) ConfigureDevice(name string, cfg wgtypes.Config) error {
 	}
 
 	for _, batch := range batches {
-		attrs, err := configAttrs(name, batch)
+		attrs, err := configAttrs(name, batch, family.Version)
 		if err != nil {
 			return err
 		}
@@ -213,16 +213,38 @@ func (c *Client) getDeviceInternal(name string, family genetlink.Family) (*wgtyp
 		return nil, err
 	}
 
-	d, err := parseDevice(msgs)
+	d, err := parseDevice(msgs, family.Version)
 	if err != nil {
 		return nil, err
 	}
 
 	if family.Name == amneziaGenlName {
 		d.IsAmnezia = true
+		d.AmneziaVersion = amneziaVersion(family.Version)
+		// AmneziaWG 3.1 always advertises its random trailers capability,
+		// which is how 3.0 and 3.1 are told apart within netlink version 3.
+		if d.SawRandomTrailers {
+			d.AmneziaVersion = wgtypes.AWG31
+		}
 	}
 
 	return d, nil
+}
+
+// amneziaVersion maps a generic netlink family version to an AmneziaWG
+// generation. Version 3 covers both 3.0 and 3.1; those are told apart by
+// AmneziaWG 3.1's random trailers attribute, which the kernel always emits.
+func amneziaVersion(version uint8) wgtypes.AmneziaVersion {
+	switch version {
+	case 1:
+		return wgtypes.AWG15
+	case 2:
+		return wgtypes.AWG20
+	case 3:
+		return wgtypes.AWG30
+	default:
+		return wgtypes.AWGNone
+	}
 }
 
 // execute executes a single Netlink request.

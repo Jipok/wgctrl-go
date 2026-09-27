@@ -17,13 +17,14 @@ import (
 
 // parseDevice parses a Device from a slice of generic netlink messages,
 // automatically merging peer lists from subsequent messages into the Device
-// from the first message.
-func parseDevice(msgs []genetlink.Message) (*wgtypes.Device, error) {
+// from the first message. version is the generic netlink family version, used
+// to pick the right width for fields AmneziaWG has changed.
+func parseDevice(msgs []genetlink.Message, version uint8) (*wgtypes.Device, error) {
 	var first wgtypes.Device
 	knownPeers := make(map[wgtypes.Key]int)
 
 	for i, m := range msgs {
-		d, err := parseDeviceLoop(m)
+		d, err := parseDeviceLoop(m, version)
 		if err != nil {
 			return nil, err
 		}
@@ -50,7 +51,7 @@ func parseDevice(msgs []genetlink.Message) (*wgtypes.Device, error) {
 }
 
 // parseDeviceLoop parses a Device from a single generic netlink message.
-func parseDeviceLoop(m genetlink.Message) (*wgtypes.Device, error) {
+func parseDeviceLoop(m genetlink.Message, version uint8) (*wgtypes.Device, error) {
 	ad, err := netlink.NewAttributeDecoder(m.Data)
 	if err != nil {
 		return nil, err
@@ -72,6 +73,60 @@ func parseDeviceLoop(m genetlink.Message) (*wgtypes.Device, error) {
 			d.ListenPort = int(ad.Uint16())
 		case unix.WGDEVICE_A_FWMARK:
 			d.FirewallMark = int(ad.Uint32())
+		case WGDEVICE_A_JC:
+			d.Jc = int(ad.Uint16())
+		case WGDEVICE_A_JMIN:
+			d.Jmin = int(ad.Uint16())
+		case WGDEVICE_A_JMAX:
+			d.Jmax = int(ad.Uint16())
+		case WGDEVICE_A_S1:
+			d.S1 = int(ad.Uint16())
+		case WGDEVICE_A_S2:
+			d.S2 = int(ad.Uint16())
+		case WGDEVICE_A_S3:
+			d.S3 = int(ad.Uint16())
+		case WGDEVICE_A_S4:
+			d.S4 = int(ad.Uint16())
+		case WGDEVICE_A_H1, WGDEVICE_A_H2, WGDEVICE_A_H3, WGDEVICE_A_H4:
+			// Same three-way split as on the encoding side.
+			switch {
+			case version < 2:
+				v := ad.Uint32()
+				setHeader(&d, ad.Type(), wgtypes.UintRange{Lo: v, Hi: v})
+			case version < 3:
+				r, err := wgtypes.ParseUintRange(ad.String())
+				if err != nil {
+					return nil, err
+				}
+				setHeader(&d, ad.Type(), r)
+			default:
+				v := ad.Uint64()
+				setHeader(&d, ad.Type(), wgtypes.UintRange{Lo: uint32(v), Hi: uint32(v >> 32)})
+			}
+		case WGDEVICE_A_I1, WGDEVICE_A_I2, WGDEVICE_A_I3, WGDEVICE_A_I4, WGDEVICE_A_I5:
+			setCustomPacket(&d, ad.Type(), ad.String())
+		case WGDEVICE_A_HEADER_PROTECTION_KEY:
+			if b := ad.Bytes(); len(b) == 32 {
+				key := [32]byte(b)
+				d.HeaderProtectionKey = &key
+			}
+		case WGDEVICE_A_CONTENT_PADDING_ADDITION:
+			d.ContentPaddingAddition = unpackTiming(ad.Uint32())
+		case WGDEVICE_A_REKEY_AFTER_TIME:
+			d.RekeyAfterTime = unpackTiming(ad.Uint32())
+		case WGDEVICE_A_REKEY_TIMEOUT:
+			d.RekeyTimeout = unpackTiming(ad.Uint32())
+		case WGDEVICE_A_REJECT_AFTER_TIME:
+			d.RejectAfterTime = unpackTiming(ad.Uint32())
+		case WGDEVICE_A_KEEPALIVE_TIMEOUT:
+			d.KeepaliveTimeout = unpackTiming(ad.Uint32())
+		case WGDEVICE_A_MAX_HANDSHAKE_ATTEMPTS:
+			d.MaxHandshakeAttempts = unpackTiming(ad.Uint32())
+		case WGDEVICE_A_RANDOM_TRAILERS:
+			d.RandomTrailers = ad.Uint8() != 0
+			d.SawRandomTrailers = true
+		case WGDEVICE_A_DISABLE_COOKIES:
+			d.DisableCookies = ad.Uint8() != 0
 		case unix.WGDEVICE_A_PEERS:
 			// Netlink array of peers.
 			//
@@ -82,7 +137,7 @@ func parseDeviceLoop(m genetlink.Message) (*wgtypes.Device, error) {
 				d.Peers = make([]wgtypes.Peer, 0, nad.Len())
 				for nad.Next() {
 					nad.Nested(func(nnad *netlink.AttributeDecoder) error {
-						d.Peers = append(d.Peers, parsePeer(nnad))
+						d.Peers = append(d.Peers, parsePeer(nnad, version))
 						return nil
 					})
 				}
@@ -99,8 +154,45 @@ func parseDeviceLoop(m genetlink.Message) (*wgtypes.Device, error) {
 	return &d, nil
 }
 
+// setHeader stores a parsed magic header range into its Device field.
+func setHeader(d *wgtypes.Device, attr uint16, r wgtypes.UintRange) {
+	switch attr {
+	case WGDEVICE_A_H1:
+		d.H1 = r
+	case WGDEVICE_A_H2:
+		d.H2 = r
+	case WGDEVICE_A_H3:
+		d.H3 = r
+	case WGDEVICE_A_H4:
+		d.H4 = r
+	}
+}
+
+// setCustomPacket stores a parsed custom packet signature into its Device field.
+func setCustomPacket(d *wgtypes.Device, attr uint16, spec string) {
+	switch attr {
+	case WGDEVICE_A_I1:
+		d.I1 = spec
+	case WGDEVICE_A_I2:
+		d.I2 = spec
+	case WGDEVICE_A_I3:
+		d.I3 = spec
+	case WGDEVICE_A_I4:
+		d.I4 = spec
+	case WGDEVICE_A_I5:
+		d.I5 = spec
+	}
+}
+
+// unpackTiming reverses the uint16 range packing used by the 3.0 timing
+// parameters, which store a low bound in the low word and a high bound in the
+// high word.
+func unpackTiming(v uint32) *wgtypes.UintRange {
+	return &wgtypes.UintRange{Lo: v & 0xffff, Hi: v >> 16}
+}
+
 // parseAllowedIPs parses a wgtypes.Peer from a netlink attribute payload.
-func parsePeer(ad *netlink.AttributeDecoder) wgtypes.Peer {
+func parsePeer(ad *netlink.AttributeDecoder, version uint8) wgtypes.Peer {
 	var p wgtypes.Peer
 	for ad.Next() {
 		switch ad.Type() {
@@ -112,7 +204,14 @@ func parsePeer(ad *netlink.AttributeDecoder) wgtypes.Peer {
 			p.Endpoint = &net.UDPAddr{}
 			ad.Do(parseSockaddr(p.Endpoint))
 		case unix.WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL:
-			p.PersistentKeepaliveInterval = time.Duration(ad.Uint16()) * time.Second
+			// A plain uint16 before AmneziaWG 3.0, a packed u16 range
+			// (lo | hi<<16) from 3.0 on. Unpack the low bound, which is the
+			// value the interval is actually picked from.
+			if version < 3 {
+				p.PersistentKeepaliveInterval = time.Duration(ad.Uint16()) * time.Second
+			} else {
+				p.PersistentKeepaliveInterval = time.Duration(uint16(ad.Uint32())) * time.Second
+			}
 		case unix.WGPEER_A_LAST_HANDSHAKE_TIME:
 			ad.Do(parseTimespec(&p.LastHandshakeTime))
 		case unix.WGPEER_A_RX_BYTES:
